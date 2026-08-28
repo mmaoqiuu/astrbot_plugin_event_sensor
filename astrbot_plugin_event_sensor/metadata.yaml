@@ -1,0 +1,6 @@
+name: astrbot_plugin_event_sensor
+display_name: 手机事件感知器
+desc: 接收手机自动化事件上报（如打开App），即时唤醒对话。
+version: v1.4.0
+author: ""
+repo: ""
