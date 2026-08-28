@@ -1,0 +1,74 @@
+{
+  "auth_token": {
+    "description": "接收端密钥",
+    "type": "string",
+    "hint": "手机上报时在请求头 X-Sensor-Token 里带上同样的值。留空会自动生成专属密钥（重载插件后可见）。",
+    "obvious_hint": true
+  },
+  "listen_port": {
+    "description": "接收端监听端口",
+    "type": "int",
+    "default": 8788,
+    "hint": "接收事件上报的端口（默认 8788）。需在服务器防火墙放行此端口。改完要重载插件才生效。"
+  },
+  "bot_qq_id": {
+    "description": "机器人 QQ 号",
+    "type": "string",
+    "default": "",
+    "hint": "机器人的 QQ 号，留空会自动获取。"
+  },
+  "active_start_time": {
+    "description": "默认互动开始时间",
+    "type": "string",
+    "default": "08:00",
+    "hint": "允许常规触发抓包互动的时间段起点，格式 HH:MM（如 08:00 或 01:30）。"
+  },
+  "active_end_time": {
+    "description": "默认互动结束时间",
+    "type": "string",
+    "default": "23:30",
+    "hint": "允许常规触发抓包互动的时间段终点，格式 HH:MM（如 23:30 或 06:00）。"
+  },
+  "trigger_keywords": {
+    "description": "关键词临时提前开启抓包",
+    "type": "string",
+    "default": "老公晚安,晚安,睡觉了,去睡了,睡觉觉,做梦去啦",
+    "hint": "在对话中只要捕捉到这些关键词（逗号分隔），就会立刻临时激活抓包模式，直到原定的互动结束时间自动恢复。"
+  },
+  "dialogue_end_keywords": {
+    "description": "告别/对话结束豁免关键词",
+    "type": "string",
+    "default": "去玩会儿手机,去玩手机,玩会手机,先去忙了,去忙了,去洗澡,去吃饭,出门了,先下了,拜拜",
+    "hint": "用户发送包含这些关键词的消息告别后，双方对话处于预期内的自然收尾，此时即使超时未回复也不会触发已读不回抓包。"
+  },
+  "cooldown_minutes": {
+    "description": "防刷触发冷却（分钟）",
+    "type": "int",
+    "default": 0,
+    "hint": "每次触发抓包后的最小冷却时间（分钟），0 表示无冷却。"
+  },
+  "enable_unreplied_trigger": {
+    "description": "启用未回复抓包模式",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，如果 LLM 发了最后一条消息且用户超时未回复，打开App时会触发抓包（不受时间段限制）。"
+  },
+  "unreplied_threshold_minutes": {
+    "description": "未回复抓包判定时长（分钟）",
+    "type": "int",
+    "default": 30,
+    "hint": "LLM 发完消息后，超过多少分钟用户未回复时，打开App会被判定为抓包（默认 30 分钟）。"
+  },
+  "prompt_keyword_catch": {
+    "description": "装睡/晚安抓包提示词模板",
+    "type": "string",
+    "default": "【系统实时感知事件（关键词触发提前抓包/装睡抓包）】用户在 {minutes} 分钟前发了「{text}」（触发了关键词「{keyword}」），此时系统检测到对方并没有入睡或离开，而是在手机上打开了「{app_name}」。请结合当前对话上下文与你的角色人设性格，自然地抓包、调侃或逗弄对方（比如：抓到刚才说过晚安却在偷偷刷手机）。注意：这是系统后台事件通知，不是对方直接打字发给你的。",
+    "hint": "可用占位符：{minutes}（相隔分钟）、{text}（用户原话）、{keyword}（命中关键词）、{app_name}（打开的应用名）。留空则使用默认通用模板。"
+  },
+  "prompt_unreplied_catch": {
+    "description": "超时未回复抓包提示词模板",
+    "type": "string",
+    "default": "【系统实时感知事件（已读不回/超时未回复抓包）】你发完上一条消息后，对方已有超过 {minutes} 分钟没有回复你，但此时检测到对方在手机上打开了「{app_name}」。请结合当前对话上下文与你的角色人设性格，自然地抓包、吃醋、调侃或逗弄对方（比如质问怎么有空刷手机却不理你）。注意：这是系统后台事件通知，不是对方直接打字发给你的。",
+    "hint": "可用占位符：{minutes}（超时分钟）、{app_name}（打开的应用名）。留空则使用默认通用模板。"
+  }
+}
