@@ -139,17 +139,26 @@ class EventSensorPlugin(Star):
         if not sender_id:
             return
 
+        text = str(event.message_str or "").strip()
+        sender_name = str(getattr(event, "sender", None) and getattr(event.sender, "nickname", "") or "")
+        if (
+            sender_name == "wakeup"
+            or sender_name == "event_sensor"
+            or text.startswith("【系统")
+            or text.startswith("【系统实时感知事件")
+            or text.startswith("「")
+            or text.startswith("设定的休眠时间已到")
+            or getattr(event, "role", "") == "system"
+        ):
+            return
+
         self._last_user_msg_time = now
         self._last_event = event
         umo = getattr(event, "unified_msg_origin", None)
         if umo:
             self._target_umo = umo
 
-        text = str(event.message_str or "").strip()
         if text:
-            # 过滤系统伪造的注入通知，避免循环触发或污染上一条真实发言
-            if text.startswith("【系统") or text.startswith("【系统实时感知事件"):
-                return
             self._dialogue_ended_by_farewell = False
             self._farewell_reason = ""
 
@@ -311,13 +320,9 @@ class EventSensorPlugin(Star):
             is_unreplied_catch = False
             unreplied_duration_min = 0
             if enable_unreplied and not self._dialogue_ended_by_farewell:
-                if self._last_bot_msg_time > self._last_user_msg_time:
-                    diff = now - self._last_bot_msg_time
-                    if diff >= unreplied_thresh:
-                        is_unreplied_catch = True
-                        unreplied_duration_min = int(diff // 60)
-                elif self._last_bot_msg_time > 0 and self._last_user_msg_time == 0:
-                    diff = now - self._last_bot_msg_time
+                # 判定条件：以用户上次发言时间为基准（类似 wakeup），只要用户发完消息后超过阈值未再次回复
+                if self._last_user_msg_time > 0:
+                    diff = now - self._last_user_msg_time
                     if diff >= unreplied_thresh:
                         is_unreplied_catch = True
                         unreplied_duration_min = int(diff // 60)
