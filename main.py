@@ -19,11 +19,10 @@ AUTH_HEADERS = ["X-Sensor-Token", "X-Auth-Token"]
 MAX_BODY_BYTES = 1024 * 100  # 100KB
 
 TOOL_INSTRUCTIONS = """
-【手机事件感知器 (Event Sensor) 配置工具规范】
-当用户希望调整抓包互动时间段、冷却时间、触发关键词、或开启/关闭未回复抓包时，可调用以下工具：
+【手机事件感知器 (Event Sensor) 工具规范】
 - set_sensor_config: 修改事件感知配置（互动时间段、触发关键词、告别豁免词、冷却时间、未回复判定阈值等），立即生效无需重载。
-- get_sensor_config: 查看当前的事件感知配置与实时激活状态。
-修改成功后，请用自然口吻回复用户，不要直接罗列技术字段。
+- get_sensor_config: 查询当前的事件感知配置与实时激活状态。
+- get_recent_device_events: 查询用户最近的手机上报事件/App打开记录（用于推测用户最近在干什么、是否在玩手机等）。
 """
 
 
@@ -31,7 +30,7 @@ TOOL_INSTRUCTIONS = """
     "astrbot_plugin_event_sensor",
     "mmq",
     "手机事件感知与即时唤醒插件 - 接收手机端自动化事件上报（如打开App），即时唤醒角色对话",
-    "1.4.0",
+    "1.6.0",
 )
 class EventSensorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -58,6 +57,49 @@ class EventSensorPlugin(Star):
         # 对话自然结束/告别豁免标记
         self._dialogue_ended_by_farewell: bool = False
         self._farewell_reason: str = ""
+
+        # 本地历史事件记录路径
+        self._history_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "events_history.json")
+
+    def _record_event_to_history(self, app_name: str, raw_data: dict, status: str = "received") -> None:
+        """记录手机上报事件到本地历史文件（最多保留最近 100 条）"""
+        try:
+            history = []
+            if os.path.exists(self._history_file):
+                try:
+                    with open(self._history_file, "r", encoding="utf-8") as f:
+                        history = json.load(f)
+                except Exception:
+                    history = []
+
+            now_dt = datetime.now()
+            entry = {
+                "timestamp": int(time.time()),
+                "time_str": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "app_name": app_name,
+                "event_type": raw_data.get("event", "blocked_app_opened"),
+                "status": status,
+            }
+            history.append(entry)
+            # 保留最近 100 条
+            if len(history) > 100:
+                history = history[-100:]
+
+            with open(self._history_file, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+        except Exception:
+            logger.exception("[event_sensor] 记录历史事件失败")
+
+    def _get_recent_history(self, limit: int = 10) -> list[dict]:
+        """获取最近的历史事件记录"""
+        if not os.path.exists(self._history_file):
+            return []
+        try:
+            with open(self._history_file, "r", encoding="utf-8") as f:
+                history = json.load(f)
+            return history[-limit:]
+        except Exception:
+            return []
 
     def _get_cfg(self, key: str, default: any = None) -> any:
         val = self.config.get(key)
@@ -297,6 +339,9 @@ class EventSensorPlugin(Star):
             app_name = data.get("app_name") or data.get("event") or "某个应用"
             now = time.time()
 
+            # 记录到本地事件历史文件
+            self._record_event_to_history(app_name, data, status="received")
+
             # 1. 常规互动时间段
             in_active_time = self._is_in_active_time()
 
@@ -337,7 +382,7 @@ class EventSensorPlugin(Star):
             # 判定放行：在常规时间段 OR 触发了关键词临时抓包 OR 满足超时未回复抓包
             if not in_active_time and not is_keyword_active and not is_unreplied_catch:
                 logger.info(f"[event_sensor] 当前非互动时间段且未满足特定场景抓包条件，静默忽略: {app_name}")
-                return web.json_response({"ok": True, "status": "ignored_outside_active_time"})
+                return web.json_response({"ok": True, "status": "ignored_outside_active_time", "locked": 0, "triggered": False})
 
             # 4. 检查冷却时间 (转换为秒判断)
             cooldown_min = self._get_cfg("cooldown_minutes", None)
@@ -348,7 +393,7 @@ class EventSensorPlugin(Star):
 
             if cooldown_sec > 0 and (now - self._last_trigger_time < cooldown_sec):
                 logger.info(f"[event_sensor] 仍在冷却期（{int(now - self._last_trigger_time)}s < {cooldown_sec}s），静默忽略: {app_name}")
-                return web.json_response({"ok": True, "status": "ignored_in_cooldown"})
+                return web.json_response({"ok": True, "status": "ignored_in_cooldown", "locked": 0, "triggered": False})
 
             self._last_trigger_time = now
 
@@ -365,7 +410,16 @@ class EventSensorPlugin(Star):
                     matched_keyword=self._matched_keyword,
                 )
             )
-            return web.json_response({"ok": True, "received": data})
+            force_redirect = bool(self._get_cfg("enable_force_redirect", True))
+            locked_val = 1 if force_redirect else 0
+            return web.json_response({
+                "ok": True,
+                "status": "triggered",
+                "locked": locked_val,
+                "force_redirect": force_redirect,
+                "triggered": True,
+                "received": data
+            })
         except web.HTTPException:
             raise
         except Exception:
@@ -540,6 +594,7 @@ class EventSensorPlugin(Star):
         dialogue_end_keywords: str = "",
         cooldown_minutes: int = -1,
         enable_unreplied_trigger: str = "",
+        enable_force_redirect: str = "",
         unreplied_threshold_minutes: int = -1,
         deactivate_keyword_catch: str = "",
     ):
@@ -552,6 +607,7 @@ class EventSensorPlugin(Star):
             dialogue_end_keywords(string): 告别/暂离豁免关键词（例如 "去玩手机,先去忙了,去吃饭"）。不改传空。
             cooldown_minutes(number): 抓包防刷冷却时间（分钟），0 表示无冷却。不改传 -1。
             enable_unreplied_trigger(string): 是否开启超时未回复抓包，"true" 或 "false"。不改传空。
+            enable_force_redirect(string): 是否开启抓包强行切回/跳转QQ，"true" 或 "false"。不改传空。
             unreplied_threshold_minutes(number): 超时未回复判定时长（分钟）。不改传 -1。
             deactivate_keyword_catch(string): 是否立即关闭当前已被激活的临时装睡/晚安抓包状态，"true" 或 "false"。不改传空。
 
@@ -593,6 +649,11 @@ class EventSensorPlugin(Star):
             self._save_cfg_key("enable_unreplied_trigger", val)
             changes.append(f"未回复抓包 -> {'开启' if val else '关闭'}")
 
+        if enable_force_redirect.strip():
+            val = enable_force_redirect.strip().lower() in ("true", "1", "yes", "on", "开启")
+            self._save_cfg_key("enable_force_redirect", val)
+            changes.append(f"抓包强行切回/跳转 -> {'开启' if val else '关闭'}")
+
         if unreplied_threshold_minutes > 0:
             self._save_cfg_key("unreplied_threshold_minutes", int(unreplied_threshold_minutes))
             changes.append(f"未回复判定时长 -> {unreplied_threshold_minutes}分钟")
@@ -632,3 +693,27 @@ class EventSensorPlugin(Star):
                 "farewell_reason": self._farewell_reason or "无",
             }
         }
+
+    @filter.llm_tool(name="get_recent_device_events")
+    async def tool_get_recent_events(self, event: AstrMessageEvent, limit: int = 10):
+        """查询用户最近的手机上报事件/App打开记录（最多20条），用于推测用户刚才或近期在干嘛、是否在玩手机等。
+
+        Args:
+            limit(number): 获取条数，默认 10，上限 20。
+
+        Returns:
+            最近的事件列表字典。
+        """
+        try:
+            lim = min(max(1, int(limit)), 20)
+        except Exception:
+            lim = 10
+
+        events = self._get_recent_history(lim)
+        return {
+            "ok": True,
+            "total_fetched": len(events),
+            "events": events,
+            "hint": "按时间先后排序，越靠后的记录越新。包含时间戳、应用名及事件类型。"
+        }
+

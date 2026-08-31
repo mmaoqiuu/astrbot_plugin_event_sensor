@@ -53,6 +53,12 @@
     "default": true,
     "hint": "开启后，如果 LLM 发了最后一条消息且用户超时未回复，打开App时会触发抓包（不受时间段限制）。"
   },
+  "enable_force_redirect": {
+    "description": "启用抓包强制跳转/弹回拦截",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，抓包成功时接口会返回 locked: 1，供手机端自动化判断并强制跳转回聊天软件；关闭后即使抓包成功也只触发对话抓包，不返回拦截指令（locked: 0）。"
+  },
   "unreplied_threshold_minutes": {
     "description": "未回复抓包判定时长（分钟）",
     "type": "int",
