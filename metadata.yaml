@@ -1,6 +1,6 @@
 name: astrbot_plugin_event_sensor
-display_name: 手机事件感知器
-desc: 接收手机自动化事件上报（如打开App），即时唤醒对话。
-version: 1.6.0
-author: "mmq"
+display_name: 小狗雷达
+desc: 接收小狗手机自动化事件上报与状态感知，即时唤醒对话与抓包互动。
+version: v1.6.0
+author: "ST1016_mmq"
 repo: "https://github.com/mmaoqiuu/astrbot_plugin_event_sensor"
