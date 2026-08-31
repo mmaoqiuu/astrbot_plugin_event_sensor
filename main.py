@@ -29,7 +29,7 @@ TOOL_INSTRUCTIONS = """
 
 @register(
     "astrbot_plugin_event_sensor",
-    "",
+    "mmq",
     "手机事件感知与即时唤醒插件 - 接收手机端自动化事件上报（如打开App），即时唤醒角色对话",
     "1.4.0",
 )
