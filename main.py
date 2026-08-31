@@ -30,7 +30,7 @@ TOOL_INSTRUCTIONS = """
     "astrbot_plugin_event_sensor",
     "mmq",
     "手机事件感知与即时唤醒插件 - 接收手机端自动化事件上报（如打开App），即时唤醒角色对话",
-    "1.6.0",
+    "1.5.0",
 )
 class EventSensorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
