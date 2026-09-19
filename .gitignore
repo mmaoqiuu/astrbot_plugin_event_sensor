@@ -1,0 +1,18 @@
+# 运行期数据（不得提交）
+_config.json
+events_history.json
+*.tmp
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

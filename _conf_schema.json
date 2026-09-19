@@ -76,5 +76,77 @@
     "type": "string",
     "default": "【系统实时感知事件（已读不回/超时未回复抓包）】你发完上一条消息后，对方已有超过 {minutes} 分钟没有回复你，但此时检测到对方在手机上打开了「{app_name}」。请结合当前对话上下文与你的角色人设性格，自然地抓包、吃醋、调侃或逗弄对方（比如质问怎么有空刷手机却不理你）。注意：这是系统后台事件通知，不是对方直接打字发给你的。",
     "hint": "可用占位符：{minutes}（超时分钟）、{app_name}（打开的应用名）。留空则使用默认通用模板。"
+  },
+  "enable_closed_event": {
+    "description": "启用应用关闭事件上报",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，识别 event 为 app_closed / close 的上报，用于统计使用时长。关闭事件永远只做记录，不会触发抓包和拦截（避免关掉软件就被拽回去）。"
+  },
+  "duration_min_seconds": {
+    "description": "有效使用时长下限（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "低于该秒数的使用记录不参与时长统计，用于过滤误触、锁屏闪现等噪声，默认 60 秒。"
+  },
+  "duration_max_hours": {
+    "description": "单次使用时长上限（小时）",
+    "type": "int",
+    "default": 12,
+    "hint": "超过该小时数的记录视为脏数据（比如跨天忘了上报关闭事件），不计入时长统计，默认 12 小时。"
+  },
+  "enable_closed_care": {
+    "description": "启用护眼关怀",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，长时间使用手机或深夜退出应用时，会向对话注入一条温和的关心提醒。属于静默感知，不会触发拦截。"
+  },
+  "care_duration_threshold_minutes": {
+    "description": "长时使用判定（分钟）",
+    "type": "int",
+    "default": 45,
+    "hint": "单次使用某应用达到该分钟数时判定为长时使用，触发护眼关怀，默认 45 分钟。"
+  },
+  "care_cooldown_minutes": {
+    "description": "护眼关怀冷却（分钟）",
+    "type": "int",
+    "default": 60,
+    "hint": "两条护眼关怀之间的最短间隔，防止反复唠叨，默认 60 分钟。0 表示不冷却。"
+  },
+  "care_late_night_start": {
+    "description": "深夜时段起点",
+    "type": "string",
+    "default": "00:00",
+    "hint": "深夜关怀判定时段起点，格式 HH:MM。在此区间内退出应用也可能触发提醒。支持跨夜（如 23:00 ~ 06:00）。"
+  },
+  "care_late_night_end": {
+    "description": "深夜时段终点",
+    "type": "string",
+    "default": "06:00",
+    "hint": "深夜关怀判定时段终点，格式 HH:MM。"
+  },
+  "care_require_active_window": {
+    "description": "护眼关怀仅在互动时间段内发送",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，只有当当前时间落在互动时间段（active_start_time ~ active_end_time）内才会插话提醒，避免大半夜主动骚扰用户。"
+  },
+  "prompt_app_closed_care": {
+    "description": "退出应用护眼关怀提示词模板",
+    "type": "string",
+    "default": "【系统实时感知事件（护眼关怀）】系统检测到对方刚刚退出了「{app_name}」，本次连续使用了约 {duration_minutes} 分钟（累计使用时长）。请结合当前对话上下文与你的角色人设性格，用一句自然、简短、关心的话提醒对方注意休息（不要生硬说教，也不要暴露这是系统上报）。注意：这是系统后台事件通知，不是对方直接打字发给你的。",
+    "hint": "可用占位符：{app_name}（应用名）、{duration_minutes} 或 {minutes}（本次使用分钟）、{total_minutes}（该应用今日累计分钟）、{time_str}（当前时间 HH:MM）。留空则使用默认模板。"
+  },
+  "history_keep_days": {
+    "description": "历史事件保留天数",
+    "type": "int",
+    "default": 1,
+    "hint": "只保留最近几天的上报事件，默认 1，即只留当天（当天 00:00 起的记录）。旧的会在每次上报和插件启动时自动裁掉。"
+  },
+  "history_max_records": {
+    "description": "历史事件条数保底上限",
+    "type": "int",
+    "default": 500,
+    "hint": "防止高频上报把历史文件撑爆的兜底上限，默认 500 条。正常情况用不到，按天保留才是主规则。"
   }
 }

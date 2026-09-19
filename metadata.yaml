@@ -1,6 +1,7 @@
 name: astrbot_plugin_event_sensor
 display_name: 小狗雷达
-desc: 接收小狗手机自动化事件上报与状态感知，即时唤醒对话与抓包互动。
-version: v1.6.0
+desc: 接收小狗手机自动化事件上报与状态感知，即时唤醒对话、抓包互动，并统计应用使用时长与护眼关怀。
+short_desc: 手机事件上报感知：抓包互动 + 使用时长统计 + 护眼关怀
+version: v1.8.0
 author: "ST1016_mmq"
 repo: "https://github.com/mmaoqiuu/astrbot_plugin_event_sensor"

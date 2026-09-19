@@ -6,7 +6,7 @@ import os
 import re
 import secrets
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from aiohttp import web
 from astrbot.api.all import *
 from astrbot.api.event import filter, AstrMessageEvent
@@ -14,23 +14,33 @@ from astrbot.core.config.astrbot_config import AstrBotConfig
 
 logger = logging.getLogger("astrbot")
 
+_HM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def _is_valid_hm(text: str) -> bool:
+    """校验 "HH:MM" 时间格式，避免把非法时段写进配置。"""
+    return bool(_HM_RE.match(str(text or "").strip()))
+
 ENDPOINT_PATH = "/api/sensor/event"
 AUTH_HEADERS = ["X-Sensor-Token", "X-Auth-Token"]
 MAX_BODY_BYTES = 1024 * 100  # 100KB
+
+# 应用关闭类事件：只做时长结算与静默感知，永远不返回拦截指令
+CLOSED_EVENT_TYPES = {"app_closed", "app_close", "closed", "close", "app_closed_event"}
 
 TOOL_INSTRUCTIONS = """
 【手机事件感知器 (Event Sensor) 工具规范】
 - set_sensor_config: 修改事件感知配置（互动时间段、触发关键词、告别豁免词、冷却时间、未回复判定阈值等），立即生效无需重载。
 - get_sensor_config: 查询当前的事件感知配置与实时激活状态。
-- get_recent_device_events: 查询用户最近的手机上报事件/App打开记录（用于推测用户最近在干什么、是否在玩手机等）。
+- get_recent_device_events: 查询用户最近的手机上报事件/App打开与关闭记录，含每次连续使用时长（分钟）与今日分应用用量汇总，可用于推测用户最近在干什么、刷了多久手机等。
 """
 
 
 @register(
     "astrbot_plugin_event_sensor",
     "mmq",
-    "手机事件感知与即时唤醒插件 - 接收手机端自动化事件上报（如打开App），即时唤醒角色对话",
-    "1.5.0",
+    "手机事件感知与即时唤醒插件 - 接收手机端自动化事件上报（打开/关闭App），即时唤醒角色对话并统计使用时长",
+    "1.8.0",
 )
 class EventSensorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -61,45 +71,301 @@ class EventSensorPlugin(Star):
         # 本地历史事件记录路径
         self._history_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "events_history.json")
 
-    def _record_event_to_history(self, app_name: str, raw_data: dict, status: str = "received") -> None:
-        """记录手机上报事件到本地历史文件（最多保留最近 100 条）"""
-        try:
-            history = []
-            if os.path.exists(self._history_file):
-                try:
-                    with open(self._history_file, "r", encoding="utf-8") as f:
-                        history = json.load(f)
-                except Exception:
-                    history = []
+        # v1.8.0：应用使用时长统计（记录每个应用本轮的打开时间点，纯内存）
+        self._app_open_times: dict[str, float] = {}
+        # v1.8.0：护眼关怀注入冷却（避免同一次深夜刷手机被反复念叨）
+        self._last_care_time: float = 0.0
 
-            now_dt = datetime.now()
+    def _record_event_to_history(
+        self,
+        app_name: str,
+        raw_data: dict,
+        status: str = "received",
+        duration_seconds: int | None = None,
+        duration_minutes: float | None = None,
+    ) -> None:
+        """记录手机上报事件到本地历史文件。
+
+        保留窗口由 history_keep_days 决定（默认 1，即只留当天），
+        另有 history_max_records 作为条数保底，防止高频上报把文件撑爆。
+
+        v1.8.0：关闭事件会额外带上本次连续使用时长（秒 / 分钟）。
+        """
+        try:
+            history = self._read_history()
             entry = {
                 "timestamp": int(time.time()),
-                "time_str": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "time_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "app_name": app_name,
-                "event_type": raw_data.get("event", "blocked_app_opened"),
+                "event_type": str(raw_data.get("event") or "blocked_app_opened").strip().lower(),
                 "status": status,
             }
+            if duration_seconds is not None:
+                entry["duration_seconds"] = int(duration_seconds)
+                entry["duration_minutes"] = round(float(duration_minutes or 0.0), 1)
             history.append(entry)
-            # 保留最近 100 条
-            if len(history) > 100:
-                history = history[-100:]
-
-            with open(self._history_file, "w", encoding="utf-8") as f:
-                json.dump(history, f, ensure_ascii=False, indent=2)
+            self._write_history(self._prune_history(history))
         except Exception:
             logger.exception("[event_sensor] 记录历史事件失败")
 
-    def _get_recent_history(self, limit: int = 10) -> list[dict]:
-        """获取最近的历史事件记录"""
+    def _read_history(self) -> list[dict]:
+        """读取本地历史事件文件；文件缺失或损坏时当作空历史。"""
         if not os.path.exists(self._history_file):
             return []
         try:
             with open(self._history_file, "r", encoding="utf-8") as f:
                 history = json.load(f)
-            return history[-limit:]
+            return history if isinstance(history, list) else []
         except Exception:
             return []
+
+    def _write_history(self, history: list[dict]) -> None:
+        """原子写入：先落 .tmp 再替换，避免中途失败把历史文件写坏。"""
+        tmp = f"{self._history_file}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._history_file)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _history_keep_days(self) -> int:
+        """历史事件保留天数，默认 1（只留当天）。"""
+        try:
+            days = int(self._get_cfg("history_keep_days", 1))
+        except (TypeError, ValueError):
+            return 1
+        return days if days >= 1 else 1
+
+    def _history_max_records(self) -> int:
+        """历史事件条数保底上限，默认 500。"""
+        try:
+            n = int(self._get_cfg("history_max_records", 500))
+        except (TypeError, ValueError):
+            return 500
+        return n if n >= 1 else 500
+
+    def _prune_history(self, history: list) -> list[dict]:
+        """裁掉保留窗口之外的记录，只留最近 keep_days 天。
+
+        基准取服务器当前时间（每条记录的 time_str 就是接收时刻），
+        时间戳缺失或格式不对的脏记录直接丢弃。
+        """
+        cutoff = (datetime.now() - timedelta(days=self._history_keep_days() - 1)).date()
+        kept: list[dict] = []
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            try:
+                day = datetime.strptime(str(item.get("time_str", ""))[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if day >= cutoff:
+                kept.append(item)
+        return kept[-self._history_max_records():]
+
+    def _prune_history_file(self) -> None:
+        """启动时清一次历史，过期记录直接裁掉，日常不用手动管。"""
+        try:
+            if not os.path.exists(self._history_file):
+                return
+            history = self._read_history()
+            kept = self._prune_history(history)
+            if len(kept) == len(history):
+                return
+            self._write_history(kept)
+            logger.info(
+                f"[event_sensor] 历史事件已按天清理：{len(history)} -> {len(kept)} 条"
+            )
+        except Exception:
+            logger.exception("[event_sensor] 清理历史事件失败")
+
+    def _get_recent_history(self, limit: int = 10) -> list[dict]:
+        """获取最近的历史事件记录"""
+        return self._read_history()[-limit:]
+
+    # ==================== v1.8.0 使用时长统计 ====================
+
+    def _duration_bounds(self) -> tuple[int, float]:
+        """本次使用的有效时长区间（秒）：下限过滤误触，上限过滤跨天脏数据。"""
+        try:
+            min_sec = int(self._get_cfg("duration_min_seconds", 10))
+        except (TypeError, ValueError):
+            min_sec = 10
+        try:
+            max_sec = float(self._get_cfg("duration_max_hours", 12)) * 3600.0
+        except (TypeError, ValueError):
+            max_sec = 12 * 3600.0
+        if min_sec <= 0:
+            min_sec = 10
+        if max_sec <= 0:
+            max_sec = 12 * 3600.0
+        return min_sec, max_sec
+
+    def _note_app_opened(self, app_name: str, now: float | None = None) -> None:
+        """打开事件：登记本轮使用的起始时间。
+
+        同一个应用可能连续上报多次打开事件，这里只保留最早的一次；
+        只有距上次记录已经超过有效时长上限时，才当作新的一轮使用重新计时。
+        """
+        if not app_name:
+            return
+        now = time.time() if now is None else now
+        _, max_sec = self._duration_bounds()
+        prev = self._app_open_times.get(app_name)
+        if prev is None or (now - prev) > max_sec:
+            self._app_open_times[app_name] = now
+
+    def _consume_app_closed(self, app_name: str, now: float | None = None) -> int | None:
+        """关闭事件：结算本轮使用时长（秒）。
+
+        结算后立即清除打开标记，避免重复计算；跨度过短（误触）或过长（跨天脏数据）
+        一律返回 None，表示本轮无效、不写时长。
+        """
+        if not app_name:
+            return None
+        now = time.time() if now is None else now
+        prev = self._app_open_times.pop(app_name, None)
+        if prev is None:
+            return None
+        duration = now - prev
+        min_sec, max_sec = self._duration_bounds()
+        if duration < min_sec or duration > max_sec:
+            return None
+        return int(duration)
+
+    def _summarize_today_usage(self) -> dict:
+        """按应用汇总「今天已结算」的使用时长（分钟），用于回答她今天刷了多久。"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        by_app: dict[str, float] = {}
+        for item in self._read_history():
+            if not isinstance(item, dict):
+                continue
+            if not str(item.get("time_str", "")).startswith(today):
+                continue
+            try:
+                minutes = float(item.get("duration_minutes"))
+            except (TypeError, ValueError):
+                continue
+            name = str(item.get("app_name") or "未知应用")
+            by_app[name] = round(by_app.get(name, 0.0) + minutes, 1)
+        ordered = dict(sorted(by_app.items(), key=lambda kv: kv[1], reverse=True))
+        return {
+            "date": today,
+            "total_minutes": round(sum(by_app.values()), 1),
+            "by_app": ordered,
+        }
+
+    # ==================== v1.8.0 护眼关怀（静默感知，非抓包） ====================
+
+    def _maybe_trigger_closed_care(self, app_name: str, duration_min: float) -> bool:
+        """退出应用后，判断是否值得温和提一句（长时使用或深夜退出）。
+
+        返回是否真的注入了关怀。注意：这只是自然提醒，不会设置 locked / triggered，
+        更不会让手机端执行任何跳转拦截。
+        """
+        if not bool(self._get_cfg("enable_closed_care", True)):
+            return False
+
+        try:
+            threshold = float(self._get_cfg("care_duration_threshold_minutes", 45))
+        except (TypeError, ValueError):
+            threshold = 45.0
+
+        is_long = threshold > 0 and duration_min >= threshold
+        is_late_night = self._in_time_range(
+            self._get_cfg("care_late_night_start", "00:00"),
+            self._get_cfg("care_late_night_end", "06:00"),
+        )
+        if not is_long and not is_late_night:
+            return False
+
+        # 默认只在常规互动时间段内插话，避免角色「睡着」时被后台事件吵醒
+        if bool(self._get_cfg("care_require_active_window", True)) and not self._in_time_range(
+            self._get_cfg("active_start_time", "08:00"),
+            self._get_cfg("active_end_time", "23:30"),
+        ):
+            return False
+
+        try:
+            cooldown_sec = float(self._get_cfg("care_cooldown_minutes", 60)) * 60.0
+        except (TypeError, ValueError):
+            cooldown_sec = 3600.0
+
+        now = time.time()
+        if cooldown_sec > 0 and (now - self._last_care_time) < cooldown_sec:
+            logger.info("[event_sensor] 护眼关怀仍在冷却期，本次仅在后台记账")
+            return False
+        self._last_care_time = now
+
+        asyncio.create_task(
+            self._trigger_closed_care(app_name, duration_min, is_late_night)
+        )
+        return True
+
+    async def _trigger_closed_care(
+        self, app_name: str, duration_min: float, is_late_night: bool,
+    ) -> None:
+        """注入一句温和的护眼关怀：只说人不拦人，不触发任何强制跳转。"""
+        minutes = int(round(duration_min))
+        late_hint = "（而且是深夜）" if is_late_night else ""
+        default_prompt = (
+            f"【系统静默感知事件（应用使用时长）】对方刚刚退出了「{app_name}」{late_hint}，"
+            f"这一轮连续停留了约 {minutes} 分钟。这是后台隐私信息，仅供你参考，用来判断她现在的状态。"
+            f"你可以选择不提、继续做你原本正在做的事；如果觉得时机自然，也可以随口关心一句"
+            f"（比如眼睛累不累、该歇歇了、明天还要早起），但不要说教、不要盘问、不要显得在监控她。"
+            f"注意：这是系统后台事件通知，不是对方直接打字发给你的。"
+        )
+        try:
+            total_minutes = self._summarize_today_usage().get("by_app", {}).get(app_name, minutes)
+        except Exception:
+            logger.exception("[event_sensor] 汇总今日使用时长失败，护眼关怀退回单次时长")
+            total_minutes = minutes
+
+        prompt = self._safe_format(
+            self._get_cfg("prompt_app_closed_care", ""),
+            default_prompt,
+            app_name=app_name,
+            minutes=minutes,
+            duration_minutes=minutes,
+            total_minutes=total_minutes,
+            time_str=datetime.now().strftime("%H:%M"),
+        )
+        await self._trigger_event_wakeup(app_name, {"event": "app_closed"}, fixed_prompt=prompt)
+
+    def _safe_format(self, template: str, default: str, **kwargs) -> str:
+        """安全渲染提示词模板：模板为空用默认文案，占位符写错也不至于让任务崩掉。"""
+        tpl = str(template or "").strip()
+        if not tpl:
+            return default
+        try:
+            return tpl.format(**kwargs)
+        except (KeyError, IndexError, ValueError):
+            logger.warning("[event_sensor] 提示词模板占位符异常，已回退默认文案")
+            return default
+
+    def _in_time_range(self, start_str: str, end_str: str) -> bool:
+        """判断当前时间是否落在 [start, end] 区间内（自动处理跨夜），解析失败视为全天。"""
+        start_str = str(start_str or "").strip()
+        end_str = str(end_str or "").strip()
+        if not start_str or not end_str:
+            return True
+        try:
+            sh, sm = map(int, start_str.split(":"))
+            eh, em = map(int, end_str.split(":"))
+            t_start = dtime(sh, sm)
+            t_end = dtime(eh, em)
+        except Exception:
+            return True
+
+        now_t = datetime.now().time()
+        if t_start <= t_end:
+            return t_start <= now_t <= t_end
+        return now_t >= t_start or now_t <= t_end
 
     def _get_cfg(self, key: str, default: any = None) -> any:
         val = self.config.get(key)
@@ -230,6 +496,7 @@ class EventSensorPlugin(Star):
 
     async def initialize(self) -> None:
         self._ensure_auth_token()
+        self._prune_history_file()
         await self._start_server()
 
     async def terminate(self) -> None:
@@ -292,23 +559,11 @@ class EventSensorPlugin(Star):
                 pass
 
     def _is_in_active_time(self) -> bool:
-        start_str = str(self._get_cfg("active_start_time", "08:00")).strip()
-        end_str = str(self._get_cfg("active_end_time", "23:30")).strip()
-        if not start_str or not end_str:
-            return True
-        try:
-            sh, sm = map(int, start_str.split(":"))
-            eh, em = map(int, end_str.split(":"))
-            t_start = dtime(sh, sm)
-            t_end = dtime(eh, em)
-        except Exception:
-            return True
-
-        now_t = datetime.now().time()
-        if t_start <= t_end:
-            in_range = t_start <= now_t <= t_end
-        else:
-            in_range = now_t >= t_start or now_t <= t_end
+        """是否处于常规互动时间段；顺带把仅在时间段内有意义的临时抓包状态重置掉。"""
+        in_range = self._in_time_range(
+            self._get_cfg("active_start_time", "08:00"),
+            self._get_cfg("active_end_time", "23:30"),
+        )
 
         if in_range and self._keyword_catch_active:
             self._keyword_catch_active = False
@@ -336,8 +591,16 @@ class EventSensorPlugin(Star):
                 return web.json_response({"ok": False, "error": "bad json"}, status=400)
 
             logger.info(f"[event_sensor] 收到手机事件上报: {data}")
-            app_name = data.get("app_name") or data.get("event") or "某个应用"
+            app_name = str(data.get("app_name") or data.get("event") or "某个应用").strip()
+            event_type = str(data.get("event") or "").strip().lower()
             now = time.time()
+
+            # v1.8.0：应用关闭事件独立分流——只结算时长/静默感知，绝不拦截
+            if event_type in CLOSED_EVENT_TYPES:
+                return self._handle_app_closed(app_name, data, now)
+
+            # 打开事件：先登记本轮使用起点（不受时间段限制），再走原有抓包判定
+            self._note_app_opened(app_name, now)
 
             # 记录到本地事件历史文件
             self._record_event_to_history(app_name, data, status="received")
@@ -426,6 +689,54 @@ class EventSensorPlugin(Star):
             logger.exception("[event_sensor] 处理事件上报异常")
             return web.json_response({"ok": False, "error": "internal error"}, status=500)
 
+    def _handle_app_closed(self, app_name: str, raw_data: dict, now: float) -> web.Response:
+        """处理应用关闭事件。
+
+        关闭一律返回 locked=0 / triggered=False：用户主动退出应用不该被弹回，
+        否则会形成「关掉软件立刻被拽回聊天软件」的死循环。这里只做两件事：
+        结算本轮使用时长、必要时补一句静默的护眼关怀。
+        """
+        if not bool(self._get_cfg("enable_closed_event", True)):
+            return web.json_response({
+                "ok": True,
+                "status": "closed_ignored",
+                "locked": 0,
+                "triggered": False,
+                "received": raw_data,
+            })
+
+        duration_sec = self._consume_app_closed(app_name, now)
+        duration_min = round(duration_sec / 60.0, 1) if duration_sec else 0.0
+        self._record_event_to_history(
+            app_name,
+            raw_data,
+            status="closed",
+            duration_seconds=duration_sec,
+            duration_minutes=duration_min,
+        )
+
+        care = False
+        if duration_sec is not None:
+            care = self._maybe_trigger_closed_care(app_name, duration_min)
+            logger.info(
+                f"[event_sensor] ⏱️ 已结算 {app_name} 本轮使用时长 {duration_min} 分钟（关怀注入={care}）"
+            )
+        else:
+            logger.info(
+                f"[event_sensor] {app_name} 关闭事件：无有效打开记录或时长超出有效区间，仅记录不结算"
+            )
+
+        return web.json_response({
+            "ok": True,
+            "status": "closed",
+            "locked": 0,
+            "triggered": False,
+            "duration_seconds": duration_sec or 0,
+            "duration_minutes": duration_min,
+            "care_triggered": care,
+            "received": raw_data,
+        })
+
     async def _trigger_event_wakeup(
         self,
         app_name: str,
@@ -436,6 +747,7 @@ class EventSensorPlugin(Star):
         keyword_minutes: int = 0,
         keyword_text: str = "",
         matched_keyword: str = "",
+        fixed_prompt: str = "",
     ) -> None:
         umo = None
         bot_self_id = str(self._bot_qq_id or "")
@@ -468,44 +780,43 @@ class EventSensorPlugin(Star):
         msg_type_str = parts[1]
         is_group = "Group" in msg_type_str
 
-        if is_keyword_catch:
-            template = str(self._get_cfg("prompt_keyword_catch", "") or "").strip()
-            if template:
-                prompt = template.format(
-                    minutes=keyword_minutes,
-                    text=keyword_text,
-                    keyword=matched_keyword,
-                    app_name=app_name,
-                )
-            else:
-                prompt = (
+        if fixed_prompt:
+            prompt = fixed_prompt
+        elif is_keyword_catch:
+            prompt = self._safe_format(
+                self._get_cfg("prompt_keyword_catch", ""),
+                (
                     f"【系统实时感知事件（关键词触发提前抓包/装睡抓包）】"
                     f"对方在 {keyword_minutes} 分钟前发了「{keyword_text}」（触发了关键词「{matched_keyword}」），"
                     f"此时系统检测到对方并没有入睡或离开，而是在手机上打开了「{app_name}」。"
                     f"请结合当前对话上下文与你的角色人设性格，自然地抓包、调侃或逗弄对方（比如：抓到刚才说过晚安却在偷偷刷手机）。"
                     f"注意：这是系统后台事件通知，不是对方直接打字发给你的。"
-                )
+                ),
+                minutes=keyword_minutes,
+                text=keyword_text,
+                keyword=matched_keyword,
+                app_name=app_name,
+            )
         elif is_unreplied:
-            template = str(self._get_cfg("prompt_unreplied_catch", "") or "").strip()
-            if template:
-                prompt = template.format(
-                    minutes=unreplied_minutes,
-                    app_name=app_name,
-                )
-            else:
-                prompt = (
+            prompt = self._safe_format(
+                self._get_cfg("prompt_unreplied_catch", ""),
+                (
                     f"【系统实时感知事件（已读不回/超时未回复抓包）】你发完上一条消息后，对方已有超过 {unreplied_minutes} 分钟没有回复你，"
                     f"但此时检测到对方在手机上打开了「{app_name}」。"
                     f"请结合当前对话上下文与你的角色人设性格，自然地抓包、吃醋、调侃或逗弄对方（比如质问怎么有空刷手机却不理你）。"
                     f"注意：这是系统后台事件通知，不是对方直接打字发给你的。"
-                )
+                ),
+                minutes=unreplied_minutes,
+                app_name=app_name,
+            )
         else:
             prompt = (
-                f"【系统实时感知事件】检测到对方在手机上打开了「{app_name}」。"
-                f"请结合当前对话上下文、时间以及你和对方的状态，以符合你人设的方式自然地抓包/逗弄/回应对方。"
+                f"【系统静默感知事件】检测到对方在手机上打开了「{app_name}」。"
+                f"这是后台隐私信息，仅供你参考，用于判断她现在的状态。"
+                f"你可以选择不提，继续做你原本正在做的事；"
+                f"如果觉得时机合适，也可以用非常自然、随口一提的方式带过，不要盘问、不要说教、不要显得在监控她。"
                 f"注意：这是系统后台事件通知，不是对方直接打字发给你的。"
             )
-
         try:
             from aiocqhttp import Event as CQEvent
         except ImportError:
@@ -573,6 +884,12 @@ class EventSensorPlugin(Star):
         et = self._get_cfg("active_end_time", "23:30")
         thresh = self._get_cfg("unreplied_threshold_minutes", 30)
         cooldown = self._get_cfg("cooldown_minutes", 0)
+        closed_on = bool(self._get_cfg("enable_closed_event", True))
+        care_on = bool(self._get_cfg("enable_closed_care", True))
+        care_cd = self._get_cfg("care_cooldown_minutes", 60)
+        care_thresh = self._get_cfg("care_duration_threshold_minutes", 45)
+        night_start = self._get_cfg("care_late_night_start", "00:00")
+        night_end = self._get_cfg("care_late_night_end", "06:00")
 
         msg = (
             f"📱【手机事件感知器·关键词与配置】\n\n"
@@ -580,7 +897,10 @@ class EventSensorPlugin(Star):
             f"☕ 告别豁免词（豁免已读不回）：\n{f_str}\n\n"
             f"⏰ 互动时间段：{st} ~ {et}\n"
             f"⌛ 未回复判定时长：{thresh} 分钟\n"
-            f"🧊 防刷冷却时长：{cooldown} 分钟"
+            f"🧊 防刷冷却时长：{cooldown} 分钟\n"
+            f"⏱️ 关闭事件时长统计：{'开启' if closed_on else '关闭'}\n"
+            f"👁️ 护眼关怀：{'开启' if care_on else '关闭'}"
+            f"（长时阈值 {care_thresh} 分钟｜冷却 {care_cd} 分钟｜深夜 {night_start} ~ {night_end}）"
         )
         yield event.plain_result(msg)
 
@@ -597,6 +917,12 @@ class EventSensorPlugin(Star):
         enable_force_redirect: str = "",
         unreplied_threshold_minutes: int = -1,
         deactivate_keyword_catch: str = "",
+        enable_closed_care: str = "",
+        care_duration_threshold_minutes: int = -1,
+        care_cooldown_minutes: int = -1,
+        care_late_night_start: str = "",
+        care_late_night_end: str = "",
+        care_require_active_window: str = "",
     ):
         """修改手机事件感知器（Event Sensor）的配置，修改后立即热生效，无需重载插件。
 
@@ -610,6 +936,12 @@ class EventSensorPlugin(Star):
             enable_force_redirect(string): 是否开启抓包强行切回/跳转QQ，"true" 或 "false"。不改传空。
             unreplied_threshold_minutes(number): 超时未回复判定时长（分钟）。不改传 -1。
             deactivate_keyword_catch(string): 是否立即关闭当前已被激活的临时装睡/晚安抓包状态，"true" 或 "false"。不改传空。
+            enable_closed_care(string): 是否开启「退出应用后的护眼关怀」（长时使用/深夜退出的温和提醒），"true" 或 "false"。不改传空。
+            care_duration_threshold_minutes(number): 单次使用多久算长（触发护眼关怀，分钟）。不改传 -1。
+            care_cooldown_minutes(number): 护眼关怀两条提醒之间的最短间隔（分钟），0 表示不冷却。不改传 -1。
+            care_late_night_start(string): 深夜时段起点，格式 "HH:MM"（例如 "00:00"）。不改传空。
+            care_late_night_end(string): 深夜时段终点，格式 "HH:MM"（例如 "06:00"）。不改传空。
+            care_require_active_window(string): 是否只允许在互动时间段内发送护眼关怀，"true" 或 "false"。不改传空。
 
         Returns:
             操作结果字典。
@@ -658,6 +990,40 @@ class EventSensorPlugin(Star):
             self._save_cfg_key("unreplied_threshold_minutes", int(unreplied_threshold_minutes))
             changes.append(f"未回复判定时长 -> {unreplied_threshold_minutes}分钟")
 
+        if enable_closed_care.strip():
+            val = enable_closed_care.strip().lower() in ("true", "1", "yes", "on", "开启")
+            self._save_cfg_key("enable_closed_care", val)
+            changes.append(f"退出应用护眼关怀 -> {'开启' if val else '关闭'}")
+
+        if care_duration_threshold_minutes > 0:
+            self._save_cfg_key("care_duration_threshold_minutes", int(care_duration_threshold_minutes))
+            changes.append(f"长时使用判定 -> {care_duration_threshold_minutes}分钟")
+
+        if care_cooldown_minutes >= 0:
+            self._save_cfg_key("care_cooldown_minutes", int(care_cooldown_minutes))
+            changes.append(f"护眼关怀冷却 -> {care_cooldown_minutes}分钟")
+
+        if care_late_night_start.strip():
+            ns = care_late_night_start.strip()
+            if _is_valid_hm(ns):
+                self._save_cfg_key("care_late_night_start", ns)
+                changes.append(f"深夜时段起点 -> {ns}")
+            else:
+                changes.append(f"深夜时段起点 {ns} 格式非法（应为 HH:MM），已忽略")
+
+        if care_late_night_end.strip():
+            ne = care_late_night_end.strip()
+            if _is_valid_hm(ne):
+                self._save_cfg_key("care_late_night_end", ne)
+                changes.append(f"深夜时段终点 -> {ne}")
+            else:
+                changes.append(f"深夜时段终点 {ne} 格式非法（应为 HH:MM），已忽略")
+
+        if care_require_active_window.strip():
+            val = care_require_active_window.strip().lower() in ("true", "1", "yes", "on", "开启")
+            self._save_cfg_key("care_require_active_window", val)
+            changes.append(f"护眼关怀仅在互动时间段内 -> {'开启' if val else '关闭'}")
+
         if not changes:
             return {"ok": False, "msg": "未传入任何需要修改的配置项"}
 
@@ -691,29 +1057,44 @@ class EventSensorPlugin(Star):
                 "keyword_catch_active": self._keyword_catch_active,
                 "dialogue_ended_by_farewell": self._dialogue_ended_by_farewell,
                 "farewell_reason": self._farewell_reason or "无",
+                "enable_closed_event": self._get_cfg("enable_closed_event", True),
+                "enable_closed_care": self._get_cfg("enable_closed_care", True),
+                "care_duration_threshold_minutes": self._get_cfg("care_duration_threshold_minutes", 45),
+                "care_cooldown_minutes": self._get_cfg("care_cooldown_minutes", 60),
+                "app_in_use": {
+                    name: round((time.time() - opened) / 60.0, 1)
+                    for name, opened in self._app_open_times.items()
+                },
             }
         }
 
     @filter.llm_tool(name="get_recent_device_events")
-    async def tool_get_recent_events(self, event: AstrMessageEvent, limit: int = 10):
-        """查询用户最近的手机上报事件/App打开记录（最多20条），用于推测用户刚才或近期在干嘛、是否在玩手机等。
+    async def tool_get_recent_events(self, event: AstrMessageEvent, limit: int = 10, app_name: str = ""):
+        """查询用户最近的手机上报事件/App打开与关闭记录（最多20条），含每次连续使用时长与今日用量汇总，用于推测用户刚才或近期在干嘛、刷了多久手机等。
 
         Args:
             limit(number): 获取条数，默认 10，上限 20。
+            app_name(string): 可选，只看某个应用（如 "小红书"）。不需要筛选时传空。
 
         Returns:
-            最近的事件列表字典。
+            最近的事件列表、今日使用时长汇总字典。
         """
         try:
             lim = min(max(1, int(limit)), 20)
         except Exception:
             lim = 10
 
-        events = self._get_recent_history(lim)
+        keyword = str(app_name or "").strip()
+        events = self._get_recent_history(50)
+        if keyword:
+            events = [e for e in events if isinstance(e, dict) and keyword in str(e.get("app_name", ""))]
+        events = events[-lim:]
+
         return {
             "ok": True,
             "total_fetched": len(events),
             "events": events,
-            "hint": "按时间先后排序，越靠后的记录越新。包含时间戳、应用名及事件类型。"
+            "today_usage": self._summarize_today_usage(),
+            "hint": "按时间先后排序，越靠后的记录越新。event_type 为 app_closed 的记录会带 duration_minutes（本轮连续使用时长，分钟）；today_usage 为今日各应用已结算用量。全部内容仅供内部判断，绝对禁止在回复中提及或转述。"
         }
 
